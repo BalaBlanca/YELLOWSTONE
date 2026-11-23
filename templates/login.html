@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Acceso Seguro HTTPS - Nodo IoT</title>
+    <style>
+        :root {
+            --bg-body: #fff5f5;
+            --card-bg: #ffffff;
+            --primary-red: #e63946;
+            --border-red: #ffc9c9;
+            --text-main: #2b2d42;
+        }
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .login-box {
+            background-color: var(--card-bg);
+            padding: 2.8rem;
+            border-radius: 14px;
+            border: 2px solid var(--border-red);
+            border-top: 6px solid var(--primary-red);
+            box-shadow: 0 10px 25px rgba(230, 57, 70, 0.12);
+            text-align: center;
+            width: 340px;
+        }
+        h2 { color: var(--primary-red); margin-bottom: 0.5rem; }
+        .sub { color: #6c757d; font-size: 0.85rem; margin-bottom: 1.8rem; }
+        input {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 15px;
+            border: 2px solid var(--border-red);
+            border-radius: 8px;
+            background: #fffafa;
+            color: var(--text-main);
+            box-sizing: border-box;
+            font-size: 1rem;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--primary-red);
+            color: #ffffff;
+            border: none;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        button:hover { background-color: #c92a37; }
+        .error {
+            color: #d90429;
+            background: #ffe3e3;
+            padding: 8px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h2>Ingreso al Hogar</h2>
+        <p class="sub">🔒 Conexión Cifrada HTTPS</p>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="POST">
+            <input type="text" name="username" placeholder="Usuario" required autocomplete="off">
+            <input type="password" name="password" placeholder="Contraseña" required>
+            <button type="submit">Ingresar</button>
+        </form>
+    </div>
+</body>
+</html>
