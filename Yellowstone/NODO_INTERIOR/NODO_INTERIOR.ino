@@ -1,0 +1,312 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+
+// ==========================================
+// 1. CREDENCIALES WIFI Y BROKER (RASPBERRY PI)
+// ==========================================
+const char* WIFI_SSID   = "Dickphone";
+const char* WIFI_PASS   = "Cyberdick_12";
+const char* MQTT_BROKER = "172.20.10."; // IP local de tu Raspberry Pi
+const int   MQTT_PORT   = 1883;
+const char* CLIENT_ID   = "Nodo_Interior_ESP32S3";
+
+// ==========================================
+// 2. DEFINICIÓN DE PINES (ESP32-S3)
+// ==========================================
+#define PIN_DHT           4     // Pin digital para DHT11
+#define DHT_TYPE          DHT11
+#define PIN_MQ_ANALOG     1     // Pin ADC1 (GPIO 1) para lectura analógica del sensor MQ
+
+#define PIN_SERVO_VENTANA 12    // Servo 1: Ventana
+#define PIN_SERVO_PUERTA  13    // Servo 2: Puerta
+#define PIN_BUZZER        14    // Buzzer activo
+#define PIN_LED           16    // LED indicador
+
+// Ángulos independientes para Ventana y Puerta
+// NOTA: Si el montaje mecánico de tu ventana gira al revés,
+// pon VENTANA_CERRADA en 40 y VENTANA_ABIERTA en 0.
+#define VENTANA_CERRADA   10
+#define VENTANA_ABIERTA   40
+
+#define PUERTA_CERRADA    0
+#define PUERTA_ABIERTA    90
+
+// Tiempo mínimo entre movimientos de servos (anti-saturación en ms)
+#define DELAY_SERVOS_MS   1500  
+
+// ==========================================
+// 3. TÓPICOS MQTT
+// ==========================================
+const char* TOPIC_PUB_INTERIOR = "casa/sensores/interior"; // Envía JSON {temp, hum, gas}
+
+const char* TOPIC_SUB_GAS      = "fuga_de_gas";
+const char* TOPIC_SUB_LLUVIA   = "lluvia";
+const char* TOPIC_SUB_CALOR    = "golpe_de_calor";
+const char* TOPIC_SUB_SISMO    = "terremoto";
+
+// ==========================================
+// 4. OBJETOS Y VARIABLES DE ESTADO
+// ==========================================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+DHT dht(PIN_DHT, DHT_TYPE);
+Servo servoVentana;
+Servo servoPuerta;
+
+// Estados recibidos desde la Raspberry Pi
+bool alertaGas       = false;
+bool alertaLluvia    = false;
+bool alertaCalor     = false;
+bool alertaTerremoto = false;
+
+// Control de tiempos no bloqueantes (millis)
+uint32_t ultimoEnvioTelemetria = 0;
+uint32_t ultimoCambioParpadeo  = 0;
+bool estadoIntermitente        = false;
+
+// Variables para protección y control de cambios en servos
+uint32_t ultimoMovimientoServo = 0;
+int anguloActualVentana        = -1;
+int anguloActualPuerta         = -1;
+
+// Retención de 60 segundos para la alarma de terremoto
+uint32_t inicioTerremotoMs              = 0;
+const uint32_t DURACION_ALARMA_SISMO_MS = 60000; // 60 segundos
+
+// ==========================================
+// 5. EVALUADOR DE PRIORIDADES Y ACTUADORES
+// ==========================================
+bool interpretarMensaje(String msg) {
+  msg.trim();
+  msg.toLowerCase();
+  return (msg == "1" || msg == "si" || msg == "sí" || msg == "true");
+}
+
+// Función que aplica el delay no bloqueante con millis() y evita escrituras redundantes
+void actualizarPosicionServos(int objVentana, int objPuerta) {
+  uint32_t ahora = millis();
+
+  if (objVentana != anguloActualVentana || objPuerta != anguloActualPuerta) {
+    if (ahora - ultimoMovimientoServo >= DELAY_SERVOS_MS) {
+      if (objVentana != anguloActualVentana) {
+        servoVentana.write(objVentana);
+        anguloActualVentana = objVentana;
+      }
+      if (objPuerta != anguloActualPuerta) {
+        servoPuerta.write(objPuerta);
+        anguloActualPuerta = objPuerta;
+      }
+      ultimoMovimientoServo = ahora;
+      Serial.printf("⚙️ [SERVOS] Movimiento aplicado -> Ventana: %d° | Puerta: %d°\n", 
+                    anguloActualVentana, anguloActualPuerta);
+    }
+  }
+}
+
+void actualizarActuadores() {
+  uint32_t ahora = millis();
+  int objetivoVentana = VENTANA_CERRADA;
+  int objetivoPuerta  = PUERTA_CERRADA;
+
+  // Apagar la alerta de terremoto únicamente cuando hayan pasado 60 segundos completos
+  if (alertaTerremoto && (ahora - inicioTerremotoMs >= DURACION_ALARMA_SISMO_MS)) {
+    alertaTerremoto = false;
+    Serial.println("✅ [SISMO] Fin de los 60s de alarma. Retornando a estado normal.");
+  }
+
+  // PRIORIDAD 1: TERREMOTO (Abre puerta y ventana + Alarma rápida)
+  if (alertaTerremoto) {
+    objetivoVentana = VENTANA_ABIERTA; // 40°
+    objetivoPuerta  = PUERTA_ABIERTA;  // 90°
+
+    if (ahora - ultimoCambioParpadeo >= 150) {
+      ultimoCambioParpadeo = ahora;
+      estadoIntermitente = !estadoIntermitente;
+      digitalWrite(PIN_BUZZER, estadoIntermitente ? HIGH : LOW);
+      digitalWrite(PIN_LED, estadoIntermitente ? HIGH : LOW);
+    }
+  }
+  // PRIORIDAD 2: FUGA DE GAS + LLUVIA (Cierra ventana, abre puerta + Alarma)
+  else if (alertaGas && alertaLluvia) {
+    objetivoVentana = VENTANA_CERRADA; // 0° (Cerrada por lluvia)
+    objetivoPuerta  = PUERTA_ABIERTA;  // 90° (Abierta para ventilar gas)
+
+    if (ahora - ultimoCambioParpadeo >= 400) {
+      ultimoCambioParpadeo = ahora;
+      estadoIntermitente = !estadoIntermitente;
+      digitalWrite(PIN_BUZZER, estadoIntermitente ? HIGH : LOW);
+      digitalWrite(PIN_LED, estadoIntermitente ? HIGH : LOW);
+    }
+  }
+  // PRIORIDAD 3: SOLO FUGA DE GAS (Abre ventana, cierra puerta + Alarma)
+  else if (alertaGas) {
+    objetivoVentana = VENTANA_ABIERTA; // 40° (Abierta para ventilar gas)
+    objetivoPuerta  = PUERTA_CERRADA;  // 0° (Cerrada)
+
+    if (ahora - ultimoCambioParpadeo >= 400) {
+      ultimoCambioParpadeo = ahora;
+      estadoIntermitente = !estadoIntermitente;
+      digitalWrite(PIN_BUZZER, estadoIntermitente ? HIGH : LOW);
+      digitalWrite(PIN_LED, estadoIntermitente ? HIGH : LOW);
+    }
+  }
+  // PRIORIDAD 4: GOLPE DE CALOR (Cierra puertas y ventanas + Solo LED fijo)
+  else if (alertaCalor) {
+    objetivoVentana = VENTANA_CERRADA; // 0°
+    objetivoPuerta  = PUERTA_CERRADA;  // 0°
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(PIN_LED, HIGH);
+  }
+  // PRIORIDAD 5: SOLO LLUVIA (Cierra ventana y puerta, sin alarma)
+  else if (alertaLluvia) {
+    objetivoVentana = VENTANA_CERRADA; // 0°
+    objetivoPuerta  = PUERTA_CERRADA;  // 0°
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(PIN_LED, LOW);
+  }
+  // PRIORIDAD 6: ESTADO NORMAL (Todo cerrado en 0° y alarmas apagadas)
+  else {
+    objetivoVentana = VENTANA_CERRADA; // 0°
+    objetivoPuerta  = PUERTA_CERRADA;  // 0°
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(PIN_LED, LOW);
+  }
+
+  // Evaluar y mover los servos respetando el tiempo de enfriamiento (millis)
+  actualizarPosicionServos(objetivoVentana, objetivoPuerta);
+}
+
+// ==========================================
+// 6. CALLBACK MQTT Y CONEXIÓN
+// ==========================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String mensaje = "";
+  for (unsigned int i = 0; i < length; i++) {
+    mensaje += (char)payload[i];
+  }
+
+  bool activo = interpretarMensaje(mensaje);
+  String topicoStr = String(topic);
+
+  Serial.printf("📩 [MQTT RX] Tópico: %s | Payload: %s -> Estado: %d\n",
+                topic, mensaje.c_str(), activo);
+
+  if (topicoStr == TOPIC_SUB_GAS) {
+    alertaGas = activo;
+  } else if (topicoStr == TOPIC_SUB_LLUVIA) {
+    alertaLluvia = activo;
+  } else if (topicoStr == TOPIC_SUB_CALOR || topicoStr == "golpe de calor") {
+    alertaCalor = activo;
+  } else if (topicoStr == TOPIC_SUB_SISMO) {
+    if (activo) {
+      alertaTerremoto = true;
+      inicioTerremotoMs = millis();
+      Serial.println("🚨 [SISMO] ¡Terremoto detectado! Alarma enclavada por 60 segundos.");
+    }
+  }
+}
+
+void conectarWiFi() {
+  Serial.printf("\nConectando a WiFi: %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\n✅ WiFi conectado. IP ESP32-S3: %s\n", WiFi.localIP().toString().c_str());
+}
+
+void reconectarMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Conectando al Broker MQTT en Raspberry Pi...");
+    if (mqttClient.connect(CLIENT_ID, "pi_listener", "5678")) {
+      Serial.println(" ✅ ¡Conectado!");
+      mqttClient.subscribe(TOPIC_SUB_GAS);
+      mqttClient.subscribe(TOPIC_SUB_LLUVIA);
+      mqttClient.subscribe(TOPIC_SUB_CALOR);
+      mqttClient.subscribe("golpe de calor"); // Suscribe a ambos formatos por seguridad
+      mqttClient.subscribe(TOPIC_SUB_SISMO);
+    } else {
+      Serial.printf(" ❌ Falló (rc=%d). Reintentando en 3s...\n", mqttClient.state());
+      delay(3000);
+    }
+  }
+}
+
+// ==========================================
+// 7. SETUP Y LOOP PRINCIPAL
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_LED, LOW);
+
+  // Configurar resolución ADC del ESP32-S3 (0 a 4095)
+  analogReadResolution(12);
+
+  // Asignar temporizadores PWM por hardware en ESP32-S3
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  // Inicializar Servos
+  servoVentana.setPeriodHertz(50);
+  servoPuerta.setPeriodHertz(50);
+  servoVentana.attach(PIN_SERVO_VENTANA, 500, 2400);
+  servoPuerta.attach(PIN_SERVO_PUERTA, 500, 2400);
+
+  // Posición inicial (Normal: Ventana cerrada 0°, Puerta cerrada 0°)
+  anguloActualVentana = VENTANA_CERRADA;
+  anguloActualPuerta  = PUERTA_CERRADA;
+  servoVentana.write(anguloActualVentana);
+  servoPuerta.write(anguloActualPuerta);
+  ultimoMovimientoServo = millis();
+
+  dht.begin();
+  conectarWiFi();
+
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    conectarWiFi();
+  }
+  if (!mqttClient.connected()) {
+    reconectarMQTT();
+  }
+  mqttClient.loop();
+
+  // Ejecutar máquina de estados de actuadores continuamente (sin bloquear el loop)
+  actualizarActuadores();
+
+  // Enviar datos crudos de sensores cada 2 segundos
+  if (millis() - ultimoEnvioTelemetria >= 2000) {
+    ultimoEnvioTelemetria = millis();
+
+    float temp = dht.readTemperature();
+    float hum  = dht.readHumidity();
+    int gasRaw = analogRead(PIN_MQ_ANALOG); // Valor crudo entre 0 y 4095
+
+    if (isnan(temp) || isnan(hum)) {
+      Serial.println("⚠️ Error leyendo el sensor DHT11");
+      return;
+    }
+
+    String payload = String("{\"temp\":") + String(temp, 1) +
+                     ",\"hum\":" + String(hum, 1) +
+                     ",\"gas\":" + String(gasRaw) + "}";
+
+    mqttClient.publish(TOPIC_PUB_INTERIOR, payload.c_str());
+    Serial.printf("🚀 [MQTT TX] %s -> %s\n", TOPIC_PUB_INTERIOR, payload.c_str());
+  }
+}
