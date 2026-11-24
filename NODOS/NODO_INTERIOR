@@ -7,9 +7,9 @@
 // ==========================================
 // 1. CREDENCIALES WIFI Y BROKER (RASPBERRY PI)
 // ==========================================
-const char* WIFI_SSID   = "Dickphone";
-const char* WIFI_PASS   = "Cyberdick_12";
-const char* MQTT_BROKER = "172.20.10."; // IP local de tu Raspberry Pi
+const char* WIFI_SSID   = "";
+const char* WIFI_PASS   = "";
+const char* MQTT_BROKER = ""; // IP local de tu Raspberry Pi
 const int   MQTT_PORT   = 1883;
 const char* CLIENT_ID   = "Nodo_Interior_ESP32S3";
 
