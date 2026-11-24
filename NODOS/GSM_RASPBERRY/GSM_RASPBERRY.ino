@@ -18,10 +18,10 @@
 const char APN[]         = "web.vmovil.co";
 
 // IP numérica y puerto fijo de tu túnel Pinggy Pro
-const char MQTT_BROKER[] = "tcp://172.233.28.67:20870";
+const char MQTT_BROKER[] = "";
 const char CLIENT_ID[]   = "Nodo_Sismico_4G_01";
 const char MQTT_USER[]   = "pi_listener";
-const char MQTT_PASS[]   = "5678";
+const char MQTT_PASS[]   = "";
 const char TOPIC_SISMO[] = "sensores/mpu6050";
 
 // ==========================================
